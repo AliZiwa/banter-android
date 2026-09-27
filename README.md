@@ -1,97 +1,184 @@
-# Banter
+# Banter — architecture
 
-A group chat where everyone is fictional, the gossip is real, and **nothing leaves the phone**.
+A group chat where every member is a fictional character, each character is a
+[Koog](https://github.com/JetBrains/koog) agent, and every agent runs on a language model
+stored in the phone. No server is involved at any point.
 
-You write the cast — a taxi driver who is always five minutes away, an accountant who keeps
-receipts — give each one a private secret, and they talk. A language model runs on the device
-through [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM); each character is a
-[Koog](https://github.com/JetBrains/koog) agent wired to it. No server, no API key, no data
-bundle after the model is on the phone.
+This document is about how the pieces connect. For what the app does, open it.
 
-## Running it
+## The shape of it
 
-Needs Android Studio (JDK 17+) and an `arm64-v8a` or `x86_64` device or emulator, API 26+.
-
-```bash
-./gradlew :app:installDebug
-./gradlew :app:testDebugUnitTest
+```
+┌──────────────────────────── ui ────────────────────────────┐
+│  ChatScreen ──▶ ChatViewModel (implements Director.Stage)  │
+└───────────────────────────────┬────────────────────────────┘
+                                │ transcript, beginTurn / endTurn
+┌───────────────────────────── director ─────────────────────┐
+│  Director ── SpeakerPicker ── PromptBuilder ── ReplyCleaner│
+└───────────────────────────────┬────────────────────────────┘
+                                │ Voices.reply(character, scenario, transcript)
+┌────────────────────────────── agent ───────────────────────┐
+│  CharacterAgents ── one Koog AIAgent per profile           │
+│        └── LiteRtPromptExecutor (a Koog PromptExecutor)    │
+└───────────────────────────────┬────────────────────────────┘
+                                │ ChatEngine.reply(ReplySpec)
+┌─────────────────────────────── llm ────────────────────────┐
+│  EngineManager ── LiteRtChatEngine ── LiteRT-LM ── .litertlm│
+│  ModelStore (import / download / disk)                     │
+└────────────────────────────────────────────────────────────┘
 ```
 
-The app does nothing until a model is installed. Open the chip icon → **Model**.
+Each layer only knows the one below it through a small interface: the screen talks to a
+`Stage`, the director talks to `Voices`, the agents talk to a `ChatEngine`. That is what let
+the agent framework be dropped in without the chat loop or the UI changing.
 
-## Which model
+## One turn, end to end
 
-**Use `gemma-4-E2B-it.litertlm` — Google's own conversion.** Ungated, instruction-tuned,
-2.59 GB. It is the default URL in the Model screen.
+```mermaid
+sequenceDiagram
+    participant U as You
+    participant VM as ChatViewModel
+    participant D as Director
+    participant CA as CharacterAgents
+    participant K as Koog AIAgent (Kato)
+    participant X as LiteRtPromptExecutor
+    participant E as LiteRtChatEngine
+    participant M as LiteRT-LM
 
-This matters more than anything in this repo. The same code, same cast, same message:
+    U->>VM: send("Kato, are you coming?")
+    VM->>D: onUserMessage()  (cancels any reply in flight)
+    D->>D: ~3s beat, then SpeakerPicker → Kato
+    D->>VM: beginTurn(Kato)  → typing bubble
+    D->>CA: reply(Kato, scenario, transcript)
+    CA->>K: run("Guest: Kato, are you coming?\n\nAnswer Guest's last message directly.\nKato:")
+    K->>X: execute(Prompt[System=persona, User=turn], LLModel)
+    X->>E: reply(ReplySpec(system, prompt, sampling))
+    E->>M: createConversation(system) · sendMessageAsync(prompt)
+    M-->>E: tokens (streamed, accumulated)
+    E-->>X: full text
+    X-->>K: Message.Assistant
+    K-->>CA: String
+    CA-->>D: raw line
+    D->>D: ReplyCleaner.clean(raw)
+    D->>VM: endTurn(id, "Traffic is bad, five minutes away.")
+    D->>D: wait 10–15s for you; else pick the next speaker
+```
 
-| Model | What came out |
+## Where Koog sits
+
+### One agent per profile — `agent/CharacterAgents.kt`
+
+A character *is* an agent. `CharacterAgents` keeps a `GraphAIAgent<String, String>` per cast
+member, built with Koog's convenience factory:
+
+```kotlin
+AIAgent(
+    promptExecutor = executor,        // our LiteRT bridge, below
+    llmModel       = modelFor(character),
+    systemPrompt   = PromptBuilder.system(character, scenario),
+    temperature    = 0.8,
+)
+```
+
+The system prompt is the profile from the cast screen — name, what they do, how they talk, who
+else is in the chat, what everyone shares, and the secret only this character knows. A persona
+is fixed for an agent's lifetime, so agents are keyed by a fingerprint of that prompt and
+rebuilt whenever the profile is edited.
+
+Asking a character for a line is `agent.run(turnPrompt)`. Koog builds the `Prompt` (system +
+user message), runs its graph, and returns the assistant text. With no tools registered the
+graph is a single LLM call, which is exactly what a chat line needs.
+
+`LLModel` is given a custom provider — `LLMProvider("litertlm", "On-device")` — because Koog's
+built-in providers are all hosted services. The character's name rides along as the model id
+purely so logs say who was speaking; there is only one model file on the device.
+
+### The bridge — `agent/LiteRtPromptExecutor.kt`
+
+Koog reaches a model through `PromptExecutor`. Its shipped executors wrap OpenAI, Anthropic,
+Google, Ollama and so on — every one of them a network call. `LiteRtPromptExecutor` is the
+same contract pointed at the phone:
+
+| Koog asks for | We do |
 |---|---|
-| `gemma-4-E2B-it` (official) | *"Traffic is bad on the way to Mukono right now. Five minutes away."* |
-| `Qwen2.5-1.5B-Instruct` | *"I'm good, Nakato. Just a busy auntie with plans and people to handle!"* |
-| an "uncensored" Gemma re-upload | *"some seeds sprout in the dust of yesterday"* |
+| `execute(prompt, model, tools)` | flatten the prompt and generate; return `Message.Assistant` |
+| `executeStreaming(...)` | same, emitted as `TextDelta` then `End` |
+| `moderate(...)` | throw — there is no moderation model on the device, and inventing a verdict would be worse |
 
-Community "uncensored" re-uploads are measurably worse at following instructions and are not
-worth the download. `Gemma3-1B-IT` (gated, ~1 GB) is the fallback for weaker phones.
+Flattening is the interesting line. Koog hands over a typed list of messages; LiteRT-LM wants a
+system instruction and one user turn. Every `Message.System` becomes the system instruction,
+everything else is joined into the user turn. Temperature and max-output come from Koog's
+`LLMParams` / `LLModel` so the agent config is the single source of truth.
 
-**Import** works for any `.litertlm` you already have (download on a laptop, move it over).
-**Download** takes a URL, plus a Hugging Face token for gated repositories.
+Everything above this file is Koog. Everything below it has never heard of Koog.
 
-To push a model straight onto a debug build, no temp file needed:
+## Below the bridge — `llm/`
 
-```bash
-adb shell "run-as com.banter.app sh -c 'cat > /data/data/com.banter.app/files/models/model.litertlm'" < model.litertlm
-```
+**`ChatEngine`** is one method: `reply(ReplySpec): Flow<String>`, emitting the reply
+cumulatively. `ReplySpec` carries the system prompt, the user prompt, and sampling
+(temperature, top-k/p, repetition / presence / frequency penalties, no-repeat n-gram).
 
-## How it behaves
+**`LiteRtChatEngine`** implements it over LiteRT-LM:
 
-- **You start the conversation.** Nobody speaks into an empty room.
-- **Somebody answers after a beat** — about three seconds, not instantly.
-- **If you say nothing for 10–15 seconds, one of the others picks up the last message** and
-  carries it on. Every 10–15 seconds, as long as you stay quiet.
-- **Each character sees the last two messages.** That is the whole context, on purpose.
-- **Typing a message cuts in.** Whatever was being written is dropped; the next reply is to you.
-- **It only runs while the chat is on screen.** Generation is the most expensive thing the
-  phone does here.
+- One `Engine` per process. Loading is seconds and most of the file stays resident, so it is
+  created once and kept.
+- Generation is CPU-bound and blocking, so every call runs on one dedicated thread behind a
+  mutex. Two characters never talk through the runtime at the same time.
+- Each reply is its own short-lived `Conversation` carrying the system instruction and sampler
+  config. The prompt already contains the little context the app uses, so nothing is worth
+  keeping between turns.
+- The token stream has carried both deltas and cumulative snapshots across LiteRT-LM versions;
+  the collector detects which it got instead of assuming.
 
-## How it is put together
+**`EngineManager`** owns the lifecycle: it watches `ModelStore` for an installed `.litertlm`,
+loads it, exposes `engine` (or `null` when there is nothing to talk to) and an `EngineState`
+the UI renders. **`ModelStore`** handles getting the file onto the device — import from the
+system file picker, or download with an optional Hugging Face token — with free-space and
+metered-network checks.
 
-```
-ui/         ChatScreen · CastScreen · ModelScreen · ChatViewModel
-agent/      CharacterAgents      one Koog agent per profile
-            LiteRtPromptExecutor Koog's seam, backed by the on-device model
-director/   Director             the turn loop above
-            SpeakerPicker        who talks next
-            PromptBuilder        identity + the two lines being replied to
-            ReplyCleaner         what small models get wrong on the way out
-llm/        EngineManager · LiteRtChatEngine · ModelStore
-data/       Scenario · Character · ChatMessage · JSON persistence
-```
+## Above the bridge — `director/`
 
-Each character is a standing Koog `AIAgent` whose system prompt is its profile. Koog usually
-talks to hosted providers; `LiteRtPromptExecutor` is where a local runtime plugs in instead.
+**`Director`** is the turn loop, and the only place with opinions about pacing:
 
-### Things that are less obvious than they look
+- Nobody speaks until the user has. `Voices.ready` false (no model) also means silence.
+- After a user message: a 2.5–3.5 s beat, then one character answers.
+- After any reply: wait 10–15 s. A user message cuts the wait short; silence lets the next
+  character carry on from the last line.
+- A reply in flight is cancelled when the user types — it was composed from a transcript that
+  did not contain the new message.
+- Text is only shown when final. Generation shows a typing indicator, never a half-written
+  bubble that might be thrown away.
 
-**The user must not be called "You".** The transcript reaches the model as `Name: text` lines.
-`You: where is Stella?` reads to the model as a statement about *itself*, and the group starts
-answering the wrong person. The user gets a real name in prompts (set in the cast screen).
+**`SpeakerPicker`** — the person named in the user's message if any; otherwise anyone but the
+last speaker.
 
-**Don't show a small model a sample line.** "You sound like this: X" makes a 1–2B model say X,
-verbatim, every turn. Describe the voice; do not demonstrate it.
+**`PromptBuilder`** — the persona (system) and the turn. The turn is the last two messages as
+`Name: text` lines, then either `Answer <user>'s last message directly.` when the user spoke
+last, or a reminder of the character's own previous line when the characters are talking among
+themselves, then `<Name>:` as the completion cue. Two lines of context is deliberate for this
+proof of concept.
 
-**A reply that opens with somebody else's name is not a reply.** The model continuing the
-transcript (`Guest: Hello?`) is discarded, not trimmed into a message.
+**`ReplyCleaner`** — what small models get wrong on the way out: keeps only the first line,
+strips speaker labels of any kind, rejects a reply that opens with *somebody else's* name (the
+model continued the transcript rather than answering), removes stage directions and wrapping
+quotes, repairs punctuation glued to the next word, caps length.
 
-**With two lines of context a character cannot know it has said this before.** The prompt
-carries its own last line with "say something new", and an exact repeat is dropped anyway.
+**`Voices`** is the seam between director and agents — one interface, one method — so the
+director's tests run on a fake with no model and no Koog.
 
-**Small models do not stop.** Told to write one line, they write everyone's. Only the first
-line survives; labels of any kind are stripped; stage directions and wrapping quotes go.
+## The screen — `ui/`
 
-**Text is only shown when final.** Streaming into a bubble that might then be dropped looks
-like a character typing and erasing itself. Generation shows a typing indicator.
+`ChatViewModel` owns the transcript and implements `Director.Stage`: `beginTurn` appends a
+typing bubble, `endTurn` fills it in or removes it. The loop is started and stopped by the
+screen's lifecycle, so the characters fall silent the moment the chat is not on screen.
+`CastScreen` edits the profiles that become system prompts; `ModelScreen` drives `ModelStore`.
+
+## Data — `data/`
+
+`Scenario` (title, shared history, the user's display name, cast), `Character` (name, blurb,
+quirk, secret), `ChatMessage`. Persisted as two small JSON files. The user's name matters more
+than it looks: the transcript is fed to the model as `Name: text`, and a line reading
+`You: …` is read by the model as a statement about itself.
 
 ## Tests
 
@@ -99,12 +186,6 @@ like a character typing and erasing itself. Generation shows a typing indicator.
 ./gradlew :app:testDebugUnitTest
 ```
 
-Concentrated on the messy parts: the turn loop (fake voices on virtual time), reply cleaning,
-speaker selection, prompt construction.
-
-## Limits
-
-- The characters are fiction and will say wrong things with total confidence.
-- Two messages of context means no long-term memory. That is next week's problem.
-- Generation is CPU-bound and warms the phone.
-- Quality depends far more on the model than on anything here — see the table above.
+Concentrated where the behaviour lives: the director's loop on virtual time with fake voices
+(silence until spoken to, the beat, the 10–15 s cadence, cancellation), prompt construction,
+speaker selection, and reply cleaning.
