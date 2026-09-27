@@ -61,7 +61,7 @@ sequenceDiagram
     CA-->>D: raw line
     D->>D: ReplyCleaner.clean(raw)
     D->>VM: endTurn(id, "Traffic is bad, five minutes away.")
-    D->>D: wait 10–15s for you; else pick the next speaker
+    D->>D: wait 10–15s for you, or pick the next speaker
 ```
 
 ## Where Koog sits
