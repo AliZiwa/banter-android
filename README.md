@@ -8,29 +8,90 @@ This document is about how the pieces connect. For what the app does, open it.
 
 ## The shape of it
 
+Three layers, one Gradle module, one package per layer. Dependencies point down only:
+`presentation` → `domain` ← `data`. The `di` package is the only place that knows both sides.
+
 ```
-┌──────────────────────────── ui ────────────────────────────┐
-│  ChatScreen ──▶ ChatViewModel (implements Director.Stage)  │
-└───────────────────────────────┬────────────────────────────┘
-                                │ transcript, beginTurn / endTurn
-┌───────────────────────────── director ─────────────────────┐
-│  Director ── SpeakerPicker ── PromptBuilder ── ReplyCleaner│
-└───────────────────────────────┬────────────────────────────┘
-                                │ Voices.reply(character, scenario, transcript)
-┌────────────────────────────── agent ───────────────────────┐
-│  CharacterAgents ── one Koog AIAgent per profile           │
-│        └── LiteRtPromptExecutor (a Koog PromptExecutor)    │
-└───────────────────────────────┬────────────────────────────┘
-                                │ ChatEngine.reply(ReplySpec)
-┌─────────────────────────────── llm ────────────────────────┐
-│  EngineManager ── LiteRtChatEngine ── LiteRT-LM ── .litertlm│
-│  ModelStore (import / download / disk)                     │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────── presentation ────────────────────────┐
+│  HomeScreen ─▶ ChatScreen ─▶ ChatViewModel (MVI; Director.Stage)│
+│  CastScreen ──▶ (same ViewModel)      ModelScreen ──▶ ModelVM │
+└───────────────────────────────┬───────────────────────────────┘
+                                │ ScenarioRepository · TranscriptRepository
+                                │ EngineRepository · ModelRepository
+┌───────────────────────────── domain ─────────────────────────┐
+│  Models · Repositories (interfaces) · Voices                  │
+│  Director ── SpeakerPicker ── PromptBuilder ── ReplyCleaner   │
+└───────────────────────────────┬───────────────────────────────┘
+                                │ implemented by
+┌────────────────────────────── data ──────────────────────────┐
+│  LocalStorage      Room (transcript) · DataStore (scenario)   │
+│  ModelRepositoryImpl   files on disk · Retrofit (download)    │
+│  LiteRtEngine      LiteRtChatEngine · EngineManager           │
+│  CharacterAgents   one Koog AIAgent per profile · executor    │
+└───────────────────────────────────────────────────────────────┘
+                     di/AppModule: Hilt wiring
 ```
 
-Each layer only knows the one below it through a small interface: the screen talks to a
-`Stage`, the director talks to `Voices`, the agents talk to a `ChatEngine`. That is what let
-the agent framework be dropped in without the chat loop or the UI changing.
+```
+app/src/main/java/com/banter/app
+├── BanterApp.kt            @HiltAndroidApp
+├── MainActivity.kt         @AndroidEntryPoint
+├── di/AppModule.kt         Room, DataStore, OkHttp/Retrofit, Director; @Binds for every interface
+├── domain/
+│   ├── Models.kt           Character, Scenario, ChatMessage, EngineState, Transfer, Presets
+│   ├── Repositories.kt     ScenarioRepository, TranscriptRepository, ModelRepository,
+│   │                       EngineRepository, Voices
+│   ├── Director.kt         the turn loop
+│   ├── SpeakerPicker.kt    who talks next
+│   ├── PromptBuilder.kt    persona + turn prompts
+│   └── ReplyCleaner.kt     what small models get wrong on the way out
+├── data/
+│   ├── LocalStorage.kt     Room entity/DAO/database, DataStore serializer, both repositories
+│   ├── ModelRepositoryImpl.kt  import from the picker, download via Retrofit, disk checks
+│   ├── LiteRtEngine.kt     ChatEngine over LiteRT-LM, EngineManager (EngineRepository)
+│   └── CharacterAgents.kt  Voices over Koog agents, LiteRtPromptExecutor
+└── presentation/
+    ├── BanterRoot.kt       four screens, a `when`, no navigation library
+    ├── HomeScreen.kt       pick a group: one coloured tile per scenario
+    ├── ChatViewModel.kt    ChatState / ChatIntent / ChatEffect + the ViewModel
+    ├── ChatScreen.kt       tinted by the scenario; empty state with opening lines
+    ├── CastScreen.kt       edits the scenario through the chat ViewModel
+    ├── ModelViewModel.kt   ModelState / ModelIntent + the ViewModel
+    ├── ModelScreen.kt
+    └── Theme.kt
+```
+
+## Screenshots
+
+| Pick a group | Empty chat | Three characters talking |
+|---|---|---|
+| ![Home](docs/screenshots/01-home.png) | ![Empty chat](docs/screenshots/02-empty-chat.png) | ![Chat](docs/screenshots/03-chat.png) |
+
+Taken on a Pixel emulator with Gemma 4 E2B loaded through LiteRT-LM. Every line from Musa,
+Grace and Pastor Ben was generated on the device.
+
+## Screens
+
+The home screen is a grid of tiles, one per scenario, each with its emoji and accent colour. Tapping
+one saves it as the current scenario, clears the transcript if the group changed, and opens the chat.
+The chat takes the scenario's colour: a wash of it behind the top bar, the user's bubbles filled with
+it, the send arrow and icons tinted with it. Before the first message the chat shows who is in the
+group and the scenario's opening lines as tappable suggestions. The same shapes, colours and layout
+are used by the iOS Banter app, so the two read as one product.
+
+`Scenario` carries `emoji`, `accent` (an index into `AccentPalette`) and `openers` for this. All
+three have defaults, so a scenario saved before they existed still loads.
+
+## MVI, as used here
+
+Each screen has one immutable `State`, a sealed `Intent` the screen sends, and (for chat) a
+sealed `Effect` for one-shot events such as a snackbar. The ViewModel exposes
+`state: StateFlow`, `effects: Flow`, and `onIntent(intent)` — nothing else.
+
+`ChatState` is not stored; it is *derived*: `combine(scenario, transcript, engineState, local)`
+where `local` is the little state only this screen owns (auto-chat on/off, who is typing).
+Room and DataStore are the source of truth, so a message written by the director shows up on
+screen the same way one restored at launch does.
 
 ## One turn, end to end
 
@@ -45,10 +106,11 @@ sequenceDiagram
     participant E as LiteRtChatEngine
     participant M as LiteRT-LM
 
-    U->>VM: send("Kato, are you coming?")
+    U->>VM: onIntent(Send("Kato, are you coming?"))
+    VM->>VM: TranscriptRepository.append → Room → state.messages
     VM->>D: onUserMessage()  (cancels any reply in flight)
     D->>D: ~3s beat, then SpeakerPicker → Kato
-    D->>VM: beginTurn(Kato)  → typing bubble
+    D->>VM: typing(Kato)  → typing bubble
     D->>CA: reply(Kato, scenario, transcript)
     CA->>K: run("Guest: Kato, are you coming?\n\nAnswer Guest's last message directly.\nKato:")
     K->>X: execute(Prompt[System=persona, User=turn], LLModel)
@@ -60,88 +122,20 @@ sequenceDiagram
     K-->>CA: String
     CA-->>D: raw line
     D->>D: ReplyCleaner.clean(raw)
-    D->>VM: endTurn(id, "Traffic is bad, five minutes away.")
+    D->>VM: typing(null) · say(Kato, "Traffic is bad, five minutes away.")
+    VM->>VM: TranscriptRepository.append → Room → state.messages
     D->>D: wait 10–15s for you, or pick the next speaker
 ```
 
-## Where Koog sits
+## Domain
 
-### One agent per profile — `agent/CharacterAgents.kt`
-
-A character *is* an agent. `CharacterAgents` keeps a `GraphAIAgent<String, String>` per cast
-member, built with Koog's convenience factory:
-
-```kotlin
-AIAgent(
-    promptExecutor = executor,        // our LiteRT bridge, below
-    llmModel       = modelFor(character),
-    systemPrompt   = PromptBuilder.system(character, scenario),
-    temperature    = 0.8,
-)
-```
-
-The system prompt is the profile from the cast screen — name, what they do, how they talk, who
-else is in the chat, what everyone shares, and the secret only this character knows. A persona
-is fixed for an agent's lifetime, so agents are keyed by a fingerprint of that prompt and
-rebuilt whenever the profile is edited.
-
-Asking a character for a line is `agent.run(turnPrompt)`. Koog builds the `Prompt` (system +
-user message), runs its graph, and returns the assistant text. With no tools registered the
-graph is a single LLM call, which is exactly what a chat line needs.
-
-`LLModel` is given a custom provider — `LLMProvider("litertlm", "On-device")` — because Koog's
-built-in providers are all hosted services. The character's name rides along as the model id
-purely so logs say who was speaking; there is only one model file on the device.
-
-### The bridge — `agent/LiteRtPromptExecutor.kt`
-
-Koog reaches a model through `PromptExecutor`. Its shipped executors wrap OpenAI, Anthropic,
-Google, Ollama and so on — every one of them a network call. `LiteRtPromptExecutor` is the
-same contract pointed at the phone:
-
-| Koog asks for | We do |
-|---|---|
-| `execute(prompt, model, tools)` | flatten the prompt and generate; return `Message.Assistant` |
-| `executeStreaming(...)` | same, emitted as `TextDelta` then `End` |
-| `moderate(...)` | throw — there is no moderation model on the device, and inventing a verdict would be worse |
-
-Flattening is the interesting line. Koog hands over a typed list of messages; LiteRT-LM wants a
-system instruction and one user turn. Every `Message.System` becomes the system instruction,
-everything else is joined into the user turn. Temperature and max-output come from Koog's
-`LLMParams` / `LLModel` so the agent config is the single source of truth.
-
-Everything above this file is Koog. Everything below it has never heard of Koog.
-
-## Below the bridge — `llm/`
-
-**`ChatEngine`** is one method: `reply(ReplySpec): Flow<String>`, emitting the reply
-cumulatively. `ReplySpec` carries the system prompt, the user prompt, and sampling
-(temperature, top-k/p, repetition / presence / frequency penalties, no-repeat n-gram).
-
-**`LiteRtChatEngine`** implements it over LiteRT-LM:
-
-- One `Engine` per process. Loading is seconds and most of the file stays resident, so it is
-  created once and kept.
-- Generation is CPU-bound and blocking, so every call runs on one dedicated thread behind a
-  mutex. Two characters never talk through the runtime at the same time.
-- Each reply is its own short-lived `Conversation` carrying the system instruction and sampler
-  config. The prompt already contains the little context the app uses, so nothing is worth
-  keeping between turns.
-- The token stream has carried both deltas and cumulative snapshots across LiteRT-LM versions;
-  the collector detects which it got instead of assuming.
-
-**`EngineManager`** owns the lifecycle: it watches `ModelStore` for an installed `.litertlm`,
-loads it, exposes `engine` (or `null` when there is nothing to talk to) and an `EngineState`
-the UI renders. **`ModelStore`** handles getting the file onto the device — import from the
-system file picker, or download with an optional Hugging Face token — with free-space and
-metered-network checks.
-
-## Above the bridge — `director/`
+Pure Kotlin, no Android, fully unit-tested.
 
 **`Director`** is the turn loop, and the only place with opinions about pacing:
 
 - Nobody speaks until the user has. `Voices.ready` false (no model) also means silence.
-- After a user message: a 2.5–3.5 s beat, then one character answers.
+- After a user message: a 2.5–3.5 s beat, then one character answers. The beat also gives the
+  transcript time to land in Room before the speaker is picked.
 - After any reply: wait 10–15 s. A user message cuts the wait short; silence lets the next
   character carry on from the last line.
 - A reply in flight is cancelled when the user types — it was composed from a transcript that
@@ -149,36 +143,48 @@ metered-network checks.
 - Text is only shown when final. Generation shows a typing indicator, never a half-written
   bubble that might be thrown away.
 
+It talks to the screen through `Director.Stage` (`transcript`, `typing`, `say`, `onError`)
+and to the agents through `Voices` — one interface, one method — so its tests run on fakes
+with no model, no Koog, and no database.
+
 **`SpeakerPicker`** — the person named in the user's message if any; otherwise anyone but the
 last speaker.
 
 **`PromptBuilder`** — the persona (system) and the turn. The turn is the last two messages as
 `Name: text` lines, then either `Answer <user>'s last message directly.` when the user spoke
 last, or a reminder of the character's own previous line when the characters are talking among
-themselves, then `<Name>:` as the completion cue. Two lines of context is deliberate for this
-proof of concept.
+themselves, then `<Name>:` as the completion cue.
 
-**`ReplyCleaner`** — what small models get wrong on the way out: keeps only the first line,
-strips speaker labels of any kind, rejects a reply that opens with *somebody else's* name (the
-model continued the transcript rather than answering), removes stage directions and wrapping
-quotes, repairs punctuation glued to the next word, caps length.
+**`ReplyCleaner`** — keeps only the first line, strips speaker labels of any kind, rejects a
+reply that opens with *somebody else's* name, removes stage directions and wrapping quotes,
+repairs punctuation glued to the next word, caps length.
 
-**`Voices`** is the seam between director and agents — one interface, one method — so the
-director's tests run on a fake with no model and no Koog.
+## Data
 
-## The screen — `ui/`
+**`LocalStorage.kt`** — the transcript is a Room table (`messages`), observed as a `Flow` and
+trimmed to the newest 200 rows on every insert. The scenario is a typed DataStore holding one
+JSON document, with `Presets.stella` as the default and the corruption fallback.
 
-`ChatViewModel` owns the transcript and implements `Director.Stage`: `beginTurn` appends a
-typing bubble, `endTurn` fills it in or removes it. The loop is started and stopped by the
-screen's lifecycle, so the characters fall silent the moment the chat is not on screen.
-`CastScreen` edits the profiles that become system prompts; `ModelScreen` drives `ModelStore`.
+**`ModelRepositoryImpl`** — import from the system file picker (the path that works for
+licence-gated Gemma builds), or download through a one-method Retrofit interface with an
+optional Hugging Face bearer token. Both write to `<name>.part` and rename on success, so a
+cancelled transfer never looks installed. Free-space and metered-network checks live here.
 
-## Data — `data/`
+**`LiteRtEngine.kt`** — `LiteRtChatEngine` runs a `.litertlm` file through LiteRT-LM: one
+`Engine` per process, every generation on one dedicated thread behind a mutex, each reply its
+own short-lived `Conversation`. `EngineManager` owns its lifecycle and publishes `EngineState`.
 
-`Scenario` (title, shared history, the user's display name, cast), `Character` (name, blurb,
-quirk, secret), `ChatMessage`. Persisted as two small JSON files. The user's name matters more
-than it looks: the transcript is fed to the model as `Name: text`, and a line reading
-`You: …` is read by the model as a statement about itself.
+**`CharacterAgents.kt`** — a character *is* a Koog agent, keyed by a fingerprint of its system
+prompt so an edited profile gets a fresh agent. `LiteRtPromptExecutor` is Koog's
+`PromptExecutor` contract pointed at the phone: every `Message.System` becomes the system
+instruction, everything else the user turn, sampling comes from the agent's `LLModel`.
+Everything above this file is Koog; everything below it has never heard of Koog.
+
+## Dependency injection
+
+Hilt. `AppModule` provides what needs building (Room database, DataStore, OkHttp, Retrofit,
+`Director`); `BindsModule` maps each domain interface to its data implementation. ViewModels
+are `@HiltViewModel` and reached from Compose with `hiltViewModel()`.
 
 ## Tests
 
@@ -186,6 +192,6 @@ than it looks: the transcript is fed to the model as `Name: text`, and a line re
 ./gradlew :app:testDebugUnitTest
 ```
 
-Concentrated where the behaviour lives: the director's loop on virtual time with fake voices
-(silence until spoken to, the beat, the 10–15 s cadence, cancellation), prompt construction,
-speaker selection, and reply cleaning.
+Concentrated in `domain`: the director's loop on virtual time with fake voices (silence until
+spoken to, the beat, the 10–15 s cadence, cancellation), prompt construction, speaker
+selection, and reply cleaning.
