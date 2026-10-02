@@ -1,4 +1,4 @@
-# Banter — architecture
+# Banter Android
 
 A group chat where every member is a fictional character, each character is a
 [Koog](https://github.com/JetBrains/koog) agent, and every agent runs on a language model
